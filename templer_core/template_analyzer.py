@@ -360,51 +360,49 @@ class TemplateAnalyzer:
 
     def _replace_in_xml(self, xml_content: str, old_text: str, new_text: str) -> str:
         """
-        Replace text ONLY within <w:t> tag content, not in XML structure.
-        This prevents breaking XML tags when replacing text that appears in tag names.
+        UNIVERSAL SOLUTION: Replace text ONLY within <w:t> tag content.
+
+        Uses callback-based regex replacement that:
+        - Only modifies text inside <w:t>...</w:t> tags
+        - Preserves ALL XML structure, attributes, namespaces unchanged
+        - Handles self-closing tags by not matching them
+        - Never corrupts the XML structure
+
+        Handles:
+        - Regular tags: <w:t>content</w:t>
+        - Tags with attributes: <w:t xml:space="preserve">content</w:t>
+        - Self-closing tags: <w:t/> (not matched, left unchanged)
+        - Any valid Word XML structure
         """
-        # Escape the new text for XML
+        # Escape the new text for XML special characters
         escaped_new = self._escape_xml(new_text)
 
-        # Only replace within <w:t>...</w:t> content
-        result = []
-        pos = 0
+        # Callback function that replaces text only in the content portion
+        def replace_in_wt_content(match):
+            opening_tag = match.group(1)   # <w:t> or <w:t xml:space="preserve">
+            text_content = match.group(2)  # The actual text content
+            closing_tag = match.group(3)   # </w:t>
 
-        # Find all <w:t> tags and their content
-        t_start_pattern = re.compile(r'<w:t([^>]*)>')
-
-        while pos < len(xml_content):
-            # Find next <w:t> tag
-            match = t_start_pattern.search(xml_content, pos)
-
-            if not match:
-                # No more <w:t> tags, append rest and done
-                result.append(xml_content[pos:])
-                break
-
-            # Append everything before this <w:t> tag (unchanged)
-            result.append(xml_content[pos:match.end()])
-
-            # Find the closing </w:t>
-            close_pos = xml_content.find('</w:t>', match.end())
-            if close_pos == -1:
-                # No closing tag, append rest and done
-                result.append(xml_content[match.end():])
-                break
-
-            # Get the text content between <w:t> and </w:t>
-            text_content = xml_content[match.end():close_pos]
-
-            # Replace the old_text with new_text ONLY in this content
+            # Replace old_text with escaped new text ONLY in the content
             if old_text in text_content:
                 text_content = text_content.replace(old_text, escaped_new)
 
-            result.append(text_content)
-            result.append('</w:t>')
+            # Return the complete tag with modified content
+            return opening_tag + text_content + closing_tag
 
-            pos = close_pos + 6  # len('</w:t>')
+        # Regex pattern explanation:
+        # (<w:t(?:\s[^>]*)?>)  - Group 1: Opening tag <w:t> with optional attributes
+        #                       (?:\s[^>]*)?  matches space followed by any attrs
+        #                       Does NOT match self-closing <w:t/> (requires >)
+        # ((?:(?!</w:t>).)*)   - Group 2: Content - any chars not starting </w:t>
+        #                       Uses tempered greedy token for safety
+        # (</w:t>)             - Group 3: Closing tag
+        pattern = r'(<w:t(?:\s[^>]*)?>)((?:(?!</w:t>).)*)(</w:t>)'
 
-        return ''.join(result)
+        # Apply replacement with DOTALL so . matches newlines
+        result = re.sub(pattern, replace_in_wt_content, xml_content, flags=re.DOTALL)
+
+        return result
 
     def _extract_text_from_xml(self, xml: str) -> str:
         """Extract plain text from XML"""
