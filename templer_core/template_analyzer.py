@@ -219,9 +219,19 @@ class TemplateAnalyzer:
     def _is_safe_value(self, value: str) -> bool:
         """
         Check if a value is safe to use for replacement.
-        Returns False for values that could corrupt XML.
+        Returns False for values that could corrupt XML or are likely false positives.
         """
-        if not value or len(value) < 2:
+        if not value:
+            return False
+
+        # Allow short values if they're clearly valid (currency, percentage)
+        if len(value) < 4:
+            # Allow percentages like "5%" or "40%"
+            if '%' in value:
+                return True
+            # Allow currency like "£5" or "$10"
+            if any(c in value for c in '£$€') and any(c.isdigit() for c in value):
+                return True
             return False
 
         # Reject values containing XML special characters
@@ -239,8 +249,65 @@ class TemplateAnalyzer:
         if ':' in value and value.split(':')[0] in ['w', 'xml', 'r', 'a', 'mc']:
             return False  # Looks like XML namespace prefix
 
-        # Reject values that are too short (likely false positives)
-        if len(value) < 3:
+        # CRITICAL: Reject word fragments (lowercase short strings that look like suffixes/prefixes)
+        # These cause XML corruption when they match inside tag names
+        word_fragment_patterns = [
+            'ered', 'ence', 'ment', 'tion', 'ally', 'ully', 'ness', 'able', 'ible',
+            'ual', 'uals', 'ering', 'ering', 'ious', 'eous', 'ance', 'ence', 'ment',
+            'ship', 'ward', 'wise', 'less', 'ling', 'ster', 'hood', 'like', 'most',
+            'some', 'self', 'ised', 'ized', 'ises', 'izes', 'ical', 'ular', 'ular',
+            'ling', 'ring', 'ning', 'ting', 'ping', 'ming', 'king', 'sing', 'ding',
+            'ving', 'zing', 'ying', 'fying', 'ifying', 'ifying', 'ering', 'aring',
+            'oring', 'uring', 'iring', 'dlesex', 'erence', 'erences', 'erential',
+            'entifying', 'incurring', 'lection', 'pain', 'makers', 'funds', 'cash',
+            'plans', 'when', 'subscriptions',
+        ]
+        if value.lower() in word_fragment_patterns:
+            return False
+
+        # Reject if all lowercase and looks like a word fragment (ends with common suffixes)
+        if value.islower() and len(value) < 12:
+            fragment_suffixes = ('ed', 'er', 'ing', 'ly', 'ment', 'tion', 'ness', 'ence', 'ance', 'ful', 'less', 'able', 'ible', 'ous', 'ive', 'al', 'ual', 'ial')
+            if value.endswith(fragment_suffixes):
+                return False
+
+        # Reject common English words that get falsely matched
+        common_words = {
+            'value', 'start', 'will', 'over', 'ered', 'provider', 'remains',
+            'pain', 'makers', 'funds', 'cash', 'plans', 'when', 'that', 'have',
+            'the', 'and', 'for', 'are', 'but', 'not', 'you', 'all', 'can',
+            'her', 'was', 'one', 'our', 'out', 'day', 'get', 'has', 'him',
+            'his', 'how', 'its', 'may', 'new', 'now', 'old', 'see', 'two',
+            'way', 'who', 'boy', 'did', 'own', 'say', 'she', 'too', 'use',
+        }
+        if value.lower() in common_words:
+            return False
+
+        # Reject phrases (multiple words) - these are not single values
+        if '  ' in value or value.count(' ') > 2:
+            return False
+
+        # Reject if it looks like a phrase (has common phrase patterns)
+        phrase_starts = ('to ', 'of ', 'in ', 'for ', 'and ', 'the ', 'that ', 'with ', 'from ', 'this ', 'we ', 'so ')
+        if value.lower().startswith(phrase_starts):
+            return False
+
+        # Reject common phrases that are not names
+        common_phrases = {
+            'service agreement', 'charge total annual', 'total provider charge',
+            'ongoing adviser charge', 'that you have', 'to provide independent',
+            'we ensure you', 'of the fixed', 'so therefore you', 'to decrease your',
+        }
+        if value.lower() in common_phrases:
+            return False
+
+        # CRITICAL: Reject all-lowercase alphabetic values - these are almost always word fragments
+        # Valid values are: currency (has £$€), dates (has digits), names (has capitals), refs (has digits)
+        if value.isalpha() and value.islower():
+            return False  # e.g., "dlesex", "ully", "ence", "erences"
+
+        # Reject if it's alphabetic without proper capitalization (not a proper name)
+        if value.isalpha() and len(value) > 3 and not value[0].isupper():
             return False
 
         return True
