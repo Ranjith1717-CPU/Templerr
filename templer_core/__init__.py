@@ -29,4 +29,5 @@ __all__ = [
     "TemplateAnalyzer",
     "ContentType",
     "AnalysisResult",
+    "DynamicValue",
 ]
