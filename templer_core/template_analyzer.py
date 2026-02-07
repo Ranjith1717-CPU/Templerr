@@ -310,6 +310,32 @@ class TemplateAnalyzer:
         if value.isalpha() and len(value) > 3 and not value[0].isupper():
             return False
 
+        # CRITICAL: Reject single capitalized words that are common English words
+        # These look like proper names but will corrupt compound words like "Investcentre"
+        common_capitalized_words = {
+            'invest', 'investment', 'minimum', 'maximum', 'cautious', 'moderate', 'aggressive',
+            'balanced', 'growth', 'income', 'total', 'grand', 'subtotal', 'account', 'accounts',
+            'annual', 'monthly', 'weekly', 'daily', 'pension', 'pensions', 'transfer', 'transfers',
+            'portfolio', 'portfolios', 'fund', 'funds', 'cash', 'shares', 'equity', 'equities',
+            'bond', 'bonds', 'fixed', 'flexible', 'standard', 'premium', 'basic', 'advanced',
+            'simple', 'complex', 'ongoing', 'initial', 'final', 'current', 'previous', 'next',
+            'first', 'second', 'third', 'last', 'general', 'specific', 'personal', 'joint',
+            'individual', 'corporate', 'retail', 'wholesale', 'private', 'public',
+        }
+        if value.lower() in common_capitalized_words:
+            return False
+
+        # Reject single words that are likely part of compound product names
+        # (e.g., "Invest" from "Investcentre", "Bell" from "AJ Bell")
+        if value.isalpha() and len(value) <= 10:
+            # Single short alphabetic values are risky - could be parts of compound words
+            # Only allow if it looks like a proper name (multiple capitals = likely acronym, or common name patterns)
+            if value.isupper():  # All caps like "ISA", "SIPP" - these are references, not names
+                return False
+            # Check if it's a dictionary word (simple heuristic: common word patterns)
+            if value.lower() in {'invest', 'bell', 'centre', 'center', 'trust', 'group', 'life', 'wealth'}:
+                return False
+
         return True
 
     def _find_dynamic_values(self, full_text: str) -> List[DynamicValue]:
@@ -438,6 +464,9 @@ class TemplateAnalyzer:
                         content = data.decode('utf-8')
                         original_content = content  # Keep original for fallback
 
+                        # Extract full text for substring checking
+                        full_text = self._extract_text_from_xml(content)
+
                         # STEP 1: Replace specific dynamic values with placeholders
                         # Sort by length (longest first) to avoid partial replacements
                         sorted_values = sorted(analysis.dynamic_values,
@@ -453,6 +482,16 @@ class TemplateAnalyzer:
                             if dv.original_text.startswith('&') or '&' in dv.original_text:
                                 # Handle XML entities - the text might be entity-encoded
                                 continue  # Skip values with ampersands to be safe
+
+                            # CRITICAL: Check if value appears as substring of a larger word
+                            # This prevents "Invest" from corrupting "Investcentre"
+                            if dv.original_text.isalpha():
+                                # For alphabetic values, check they appear as whole words
+                                import re as regex_check
+                                # Use word boundary to check if it appears as a standalone word
+                                pattern = r'\b' + regex_check.escape(dv.original_text) + r'\b'
+                                if not regex_check.search(pattern, full_text):
+                                    continue  # Value only appears as part of larger words - skip
 
                             placeholder = f"{{{{{dv.placeholder_name}}}}}"
                             # Replace in XML content using safe method
