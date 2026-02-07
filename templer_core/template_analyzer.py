@@ -216,6 +216,35 @@ class TemplateAnalyzer:
 
         return result
 
+    def _is_safe_value(self, value: str) -> bool:
+        """
+        Check if a value is safe to use for replacement.
+        Returns False for values that could corrupt XML.
+        """
+        if not value or len(value) < 2:
+            return False
+
+        # Reject values containing XML special characters
+        unsafe_chars = '<>&"\''
+        if any(c in value for c in unsafe_chars):
+            return False
+
+        # Reject values that look like XML entities
+        if '&amp;' in value or '&lt;' in value or '&gt;' in value:
+            return False
+
+        # Reject values that look like XML tags or fragments
+        if value.startswith('<') or value.endswith('>'):
+            return False
+        if ':' in value and value.split(':')[0] in ['w', 'xml', 'r', 'a', 'mc']:
+            return False  # Looks like XML namespace prefix
+
+        # Reject values that are too short (likely false positives)
+        if len(value) < 3:
+            return False
+
+        return True
+
     def _find_dynamic_values(self, full_text: str) -> List[DynamicValue]:
         """
         Find all specific dynamic values in the document.
@@ -228,7 +257,7 @@ class TemplateAnalyzer:
         for pattern, placeholder_base in self.NAME_CONTEXT_PATTERNS:
             for match in re.finditer(pattern, full_text, re.IGNORECASE):
                 name = match.group(1).strip() if match.lastindex else match.group(0).strip()
-                if name and name not in seen_texts and len(name) > 3:
+                if name and name not in seen_texts and len(name) > 3 and self._is_safe_value(name):
                     seen_texts.add(name)
                     placeholder = self._generate_unique_placeholder(placeholder_base)
 
@@ -249,7 +278,7 @@ class TemplateAnalyzer:
         for pattern, placeholder_base in self.VALUE_CONTEXT_PATTERNS:
             for match in re.finditer(pattern, full_text, re.IGNORECASE):
                 value = match.group(1).strip() if match.lastindex else match.group(0).strip()
-                if value and value not in seen_texts:
+                if value and value not in seen_texts and self._is_safe_value(value):
                     seen_texts.add(value)
                     placeholder = self._generate_unique_placeholder(placeholder_base)
 
@@ -274,6 +303,10 @@ class TemplateAnalyzer:
                     if value and value not in seen_texts:
                         # Skip very short values (likely false positives)
                         if len(value) < 5 and pattern_type == 'reference':
+                            continue
+
+                        # Skip unsafe values that could corrupt XML
+                        if not self._is_safe_value(value):
                             continue
 
                         # Skip common English words that get falsely matched
@@ -336,6 +369,7 @@ class TemplateAnalyzer:
 
                     if item == 'word/document.xml':
                         content = data.decode('utf-8')
+                        original_content = content  # Keep original for fallback
 
                         # STEP 1: Replace specific dynamic values with placeholders
                         # Sort by length (longest first) to avoid partial replacements
@@ -344,13 +378,23 @@ class TemplateAnalyzer:
                                               reverse=True)
 
                         for dv in sorted_values:
+                            # Safety checks - skip problematic values
+                            if not dv.original_text or len(dv.original_text) < 2:
+                                continue  # Skip empty or single-char values
+                            if '<' in dv.original_text or '>' in dv.original_text:
+                                continue  # Skip values containing XML chars
+                            if dv.original_text.startswith('&') or '&' in dv.original_text:
+                                # Handle XML entities - the text might be entity-encoded
+                                continue  # Skip values with ampersands to be safe
+
                             placeholder = f"{{{{{dv.placeholder_name}}}}}"
-                            # Replace in XML content
+                            # Replace in XML content using safe method
                             content = self._replace_in_xml(content, dv.original_text, placeholder)
 
-                        # NOTE: LLM sections (large paragraphs) are NOT replaced automatically
-                        # because they span multiple XML elements and would corrupt the document.
-                        # They are identified in the analysis for manual handling.
+                        # Validate XML structure before saving
+                        if not self._validate_xml_structure(content):
+                            # XML is corrupted, use original content
+                            content = original_content
 
                         data = content.encode('utf-8')
 
@@ -358,51 +402,108 @@ class TemplateAnalyzer:
 
         return output_io.getvalue()
 
+    def _validate_xml_structure(self, xml_content: str) -> bool:
+        """
+        Basic validation to check XML is not corrupted.
+        Returns True if XML appears valid, False if corrupted.
+        """
+        try:
+            # Check for basic tag balance
+            # Count opening and closing w:t tags
+            open_wt = xml_content.count('<w:t>') + xml_content.count('<w:t ')
+            close_wt = xml_content.count('</w:t>')
+
+            # Should be roughly equal (self-closing don't need closing)
+            if abs(open_wt - close_wt) > 10:
+                return False
+
+            # Check for obvious corruption patterns
+            corruption_patterns = [
+                '{{<',      # Placeholder breaking into XML
+                '>}}',      # Placeholder breaking into XML
+                '</w:{{',   # Closing tag corrupted
+                '{{/w:',    # Placeholder in tag
+                '<w:{{',    # Opening tag corrupted
+            ]
+            for pattern in corruption_patterns:
+                if pattern in xml_content:
+                    return False
+
+            # Try parsing with xml.etree (basic check)
+            try:
+                import xml.etree.ElementTree as ET
+                ET.fromstring(xml_content.encode('utf-8'))
+            except ET.ParseError:
+                return False
+
+            return True
+        except Exception:
+            return False
+
     def _replace_in_xml(self, xml_content: str, old_text: str, new_text: str) -> str:
         """
-        UNIVERSAL SOLUTION: Replace text ONLY within <w:t> tag content.
+        ULTRA-SAFE XML text replacement using state machine parsing.
 
-        Uses callback-based regex replacement that:
-        - Only modifies text inside <w:t>...</w:t> tags
-        - Preserves ALL XML structure, attributes, namespaces unchanged
-        - Handles self-closing tags by not matching them
-        - Never corrupts the XML structure
-
-        Handles:
-        - Regular tags: <w:t>content</w:t>
-        - Tags with attributes: <w:t xml:space="preserve">content</w:t>
-        - Self-closing tags: <w:t/> (not matched, left unchanged)
-        - Any valid Word XML structure
+        This method is completely safe because it:
+        1. Parses XML character-by-character tracking state
+        2. ONLY collects and modifies text inside <w:t>...</w:t> tags
+        3. Copies ALL other content byte-for-byte unchanged
+        4. Cannot possibly corrupt XML structure
         """
         # Escape the new text for XML special characters
         escaped_new = self._escape_xml(new_text)
 
-        # Callback function that replaces text only in the content portion
-        def replace_in_wt_content(match):
-            opening_tag = match.group(1)   # <w:t> or <w:t xml:space="preserve">
-            text_content = match.group(2)  # The actual text content
-            closing_tag = match.group(3)   # </w:t>
+        result = []
+        i = 0
+        n = len(xml_content)
 
-            # Replace old_text with escaped new text ONLY in the content
-            if old_text in text_content:
-                text_content = text_content.replace(old_text, escaped_new)
+        while i < n:
+            # Check if we're at the start of a <w:t> tag
+            # Must be exactly <w:t> or <w:t followed by space or > or /
+            # This avoids matching <w:tbl>, <w:tc>, etc.
+            if xml_content[i:i+4] == '<w:t' and i + 4 < n and xml_content[i+4] in ' >/':
+                # Find the end of this opening tag
+                tag_end = xml_content.find('>', i + 4)
+                if tag_end == -1:
+                    # Malformed XML, copy rest and exit
+                    result.append(xml_content[i:])
+                    break
 
-            # Return the complete tag with modified content
-            return opening_tag + text_content + closing_tag
+                # Check if it's self-closing <w:t/> or <w:t ... />
+                if xml_content[tag_end - 1] == '/':
+                    # Self-closing tag, copy as-is
+                    result.append(xml_content[i:tag_end + 1])
+                    i = tag_end + 1
+                    continue
 
-        # Regex pattern explanation:
-        # (<w:t(?:\s[^>]*)?>)  - Group 1: Opening tag <w:t> with optional attributes
-        #                       (?:\s[^>]*)?  matches space followed by any attrs
-        #                       Does NOT match self-closing <w:t/> (requires >)
-        # ((?:(?!</w:t>).)*)   - Group 2: Content - any chars not starting </w:t>
-        #                       Uses tempered greedy token for safety
-        # (</w:t>)             - Group 3: Closing tag
-        pattern = r'(<w:t(?:\s[^>]*)?>)((?:(?!</w:t>).)*)(</w:t>)'
+                # Regular opening tag <w:t> or <w:t attrs>
+                opening_tag = xml_content[i:tag_end + 1]
+                result.append(opening_tag)
+                i = tag_end + 1
 
-        # Apply replacement with DOTALL so . matches newlines
-        result = re.sub(pattern, replace_in_wt_content, xml_content, flags=re.DOTALL)
+                # Now find the closing </w:t>
+                close_start = xml_content.find('</w:t>', i)
+                if close_start == -1:
+                    # No closing tag found, copy rest and exit
+                    result.append(xml_content[i:])
+                    break
 
-        return result
+                # Extract text content between opening and closing tags
+                text_content = xml_content[i:close_start]
+
+                # Perform replacement ONLY on this text content
+                if old_text in text_content:
+                    text_content = text_content.replace(old_text, escaped_new)
+
+                result.append(text_content)
+                result.append('</w:t>')
+                i = close_start + 6  # len('</w:t>')
+            else:
+                # Not a <w:t> tag, copy this character as-is
+                result.append(xml_content[i])
+                i += 1
+
+        return ''.join(result)
 
     def _extract_text_from_xml(self, xml: str) -> str:
         """Extract plain text from XML"""
